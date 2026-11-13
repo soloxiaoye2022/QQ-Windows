@@ -6,6 +6,15 @@
 
 所有文件均取自腾讯官方下载源或社区归档仓库，未做任何修改。
 
+## 其它平台
+
+| 平台 | 仓库 |
+| --- | --- |
+| Linux | [QQ-Linux](https://github.com/soloxiaoye2022/QQ-Linux) |
+| Windows | 当前 |
+| macOS | [QQ-macOS](https://github.com/soloxiaoye2022/QQ-macOS) |
+| Android | [QQ-Android](https://github.com/soloxiaoye2022/QQ-Android) |
+
 ## 下载
 
 - 最新版本：[最新 Release](https://github.com/soloxiaoye2022/QQ-Windows/releases/latest)
