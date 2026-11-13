@@ -2,7 +2,9 @@
 name: update
 
 # 每日检查腾讯官方配置，发现新版本自动下载发布。
-# 官方 QQNTV2 路径对境外 IP 返回 403，此时回退到社区归档仓库取同名文件。
+# 官方 QQNTV2 路径对境外 IP 返回 403，此时回退到社区归档仓库。
+# 归档命名与官方不同（官方 QQ_9.9.37_261103_x64_01.exe / 归档 QQ9.9.37.54276_x64.exe），
+# 回退时按版本号+架构匹配，不直接用文件名。
 
 on:
   workflow_dispatch:
@@ -21,12 +23,15 @@ concurrency:
   group: update
   cancel-in-progress: false
 
+env:
+  ARCHIVE_REPO: A-Randomm-User/EXE-save
+  ARCHIVE_TAG: qq
+
 jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.cfg.outputs.version }}
-      tag: ${{ steps.cfg.outputs.tag }}
       need: ${{ steps.cfg.outputs.need }}
     steps:
       - name: 读取官方 Windows 配置
@@ -40,29 +45,22 @@ jobs:
             https://qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/pcConfig.json -o pc.json
 
           VER=$(jq -r '.Windows.version' pc.json)
-          X64=$(jq -r '.Windows.ntDownloadX64Url' pc.json)
-          # 文件名形如 QQ_9.9.37_261103_x64_01.exe，取日期部分拼 tag
-          BASE=$(basename "$X64")
-          DATE=$(echo "$BASE" | sed -E 's/^QQ_[0-9.]+_([0-9]{6})_.*$/\1/')
-          TAG="${VER}-${DATE}"
-
-          echo "版本: $VER"
-          echo "tag: $TAG"
-          echo "x64: $X64"
+          echo "官方版本: $VER"
 
           NEED=true
           if [ "$FORCE" != "true" ]; then
-            if gh api "repos/${{ github.repository }}/releases/tags/$TAG" > /dev/null 2>&1; then
+            # 仓库历史 tag 混用日期与构建号两种格式，按版本前缀判断是否已存在
+            HIT=$(gh release list --repo "${{ github.repository }}" --limit 200 \
+              --json tagName --jq "[.[] | select(.tagName | startswith(\"${VER}-\"))] | length")
+            if [ "$HIT" != "0" ]; then
               NEED=false
-              echo "已存在 $TAG，跳过"
+              echo "已存在 $VER 的发布（$HIT 条），跳过"
             fi
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "need=$NEED" >> "$GITHUB_OUTPUT"
 
-      - name: 保留配置供后续使用
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: cfg
           path: pc.json
@@ -80,60 +78,73 @@ jobs:
 
       - name: 下载安装包
         env:
-          TAG: ${{ needs.check.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p out
 
-          # 官方地址 + 社区归档回退
-          ARCHIVE=https://github.com/A-Randomm-User/EXE-save/releases/download/qq
+          # 拉取归档清单，建立「架构 -> 下载地址」映射
+          gh api "repos/$ARCHIVE_REPO/releases/tags/$ARCHIVE_TAG" > archive.json || echo '{}' > archive.json
+          jq -r --arg v "$VER" '
+            .assets[]?
+            | select(.name | test("^QQ" + ($v | gsub("\\."; "\\.")) + "\\."))
+            | [.name, .browser_download_url] | @tsv
+          ' archive.json > archive.tsv || true
+          echo "归档中匹配 $VER 的文件:"
+          cat archive.tsv || echo "  （无）"
 
+          # 从官方文件名推出日期，用于 tag
+          X64=$(jq -r '.Windows.ntDownloadX64Url' pc.json)
+          DATE=$(basename "$X64" | sed -E 's/^QQ_[0-9.]+_([0-9]{6})_.*$/\1/')
+          echo "TAG_DATE=$DATE" >> "$GITHUB_ENV"
+
+          FAILED=0
           for key in ntDownloadUrl ntDownloadX64Url ntDownloadARMUrl; do
             URL=$(jq -r --arg k "$key" '.Windows[$k]' pc.json)
             NAME=$(basename "$URL")
-            echo "处理 $NAME"
+            # 官方命名 QQ_9.9.37_261103_x86_01.exe -> 架构 x86
+            ARCH=$(echo "$NAME" | sed -E 's/^QQ_[0-9.]+_[0-9]+_([a-z0-9]+)_[0-9]+\.exe$/\1/')
+            OUT="QQ-${VER}-${DATE}-${ARCH}.exe"
+            echo "处理 $ARCH"
 
-            if curl -fsSL --retry 2 --connect-timeout 30 -o "out/$NAME" "$URL"; then
-              echo "  官方源下载成功"
+            if curl -fsSL --retry 2 --connect-timeout 30 -o "out/$OUT" "$URL"; then
+              echo "  官方源成功"
+              continue
+            fi
+
+            echo "  官方源 403，查归档"
+            AURL=$(awk -F'\t' -v a="$ARCH" '$1 ~ ("_" a "\\.exe$") {print $2; exit}' archive.tsv)
+            if [ -z "$AURL" ]; then
+              echo "::error::$ARCH 归档中无匹配"
+              FAILED=1
+              continue
+            fi
+            if curl -fsSL --retry 3 --connect-timeout 30 -o "out/$OUT" "$AURL"; then
+              echo "  归档源成功"
             else
-              echo "  官方源不可用，尝试社区归档"
-              if ! curl -fsSL --retry 3 --connect-timeout 30 -o "out/$NAME" "$ARCHIVE/$NAME"; then
-                echo "::error::$NAME 两个源都失败"
-                exit 1
-              fi
+              echo "::error::$ARCH 归档下载失败"
+              FAILED=1
             fi
           done
 
-          # 经典版（非 NT 架构）
+          # 经典版（非 NT 架构），官方 PCQQ 路径长期可用
           CLASSIC=$(jq -r '.Windows.downloadUrl' pc.json)
-          CNAME=$(basename "$CLASSIC")
-          echo "处理经典版 $CNAME"
-          curl -fsSL --retry 3 --connect-timeout 30 -o "out/$CNAME" "$CLASSIC"
+          echo "处理经典版"
+          if ! curl -fsSL --retry 3 --connect-timeout 30 \
+               -o "out/QQ-9.7.25-classic.exe" "$CLASSIC"; then
+            echo "::warning::经典版下载失败，跳过"
+            rm -f "out/QQ-9.7.25-classic.exe"
+          fi
 
+          [ "$FAILED" = "1" ] && { echo "::error::存在失败项"; exit 1; }
           ls -lh out
-
-      - name: 重命名为统一格式
-        env:
-          TAG: ${{ needs.check.outputs.tag }}
-        run: |
-          set -euo pipefail
-          cd out
-          for f in QQ_*.exe; do
-            [ -e "$f" ] || continue
-            arch=$(echo "$f" | sed -E 's/^QQ_[0-9.]+_[0-9]+_([a-z0-9]+)_[0-9]+\.exe$/\1/')
-            mv "$f" "QQ-${TAG}-${arch}.exe"
-          done
-          for f in QQ9*.exe; do
-            [ -e "$f" ] || continue
-            mv "$f" "QQ-9.7.25-classic.exe"
-          done
-          ls -lh
 
       - name: 生成校验文件并发布
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.check.outputs.tag }}
+          VER: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
           cd out
@@ -146,8 +157,10 @@ jobs:
             echo '```'
           } > ../note.md
           cd ..
+
+          TAG="${VER}-${TAG_DATE}"
           if ! gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
-            gh release create "$TAG" --repo "$REPO" --title "QQ $TAG" --notes-file note.md
+            gh release create "$TAG" --repo "$REPO" --title "QQ ${VER}" --notes-file note.md
           fi
           gh release upload "$TAG" out/* --repo "$REPO" --clobber
           echo "已发布 $TAG"
