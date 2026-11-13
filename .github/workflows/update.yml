@@ -1,0 +1,173 @@
+---
+name: update
+
+# 每日检查腾讯官方配置，发现新版本自动下载发布。
+# 官方 QQNTV2 路径对境外 IP 返回 403，此时回退到社区归档仓库取同名文件。
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 已存在同版本也强制重发
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: 0 21 * * *
+
+permissions: write-all
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.cfg.outputs.version }}
+      tag: ${{ steps.cfg.outputs.tag }}
+      need: ${{ steps.cfg.outputs.need }}
+    steps:
+      - name: 读取官方 Windows 配置
+        id: cfg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --connect-timeout 30 \
+            https://qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/pcConfig.json -o pc.json
+
+          VER=$(jq -r '.Windows.version' pc.json)
+          X64=$(jq -r '.Windows.ntDownloadX64Url' pc.json)
+          # 文件名形如 QQ_9.9.37_261103_x64_01.exe，取日期部分拼 tag
+          BASE=$(basename "$X64")
+          DATE=$(echo "$BASE" | sed -E 's/^QQ_[0-9.]+_([0-9]{6})_.*$/\1/')
+          TAG="${VER}-${DATE}"
+
+          echo "版本: $VER"
+          echo "tag: $TAG"
+          echo "x64: $X64"
+
+          NEED=true
+          if [ "$FORCE" != "true" ]; then
+            if gh api "repos/${{ github.repository }}/releases/tags/$TAG" > /dev/null 2>&1; then
+              NEED=false
+              echo "已存在 $TAG，跳过"
+            fi
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "need=$NEED" >> "$GITHUB_OUTPUT"
+
+      - name: 保留配置供后续使用
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfg
+          path: pc.json
+          retention-days: 1
+
+  build:
+    needs: check
+    if: needs.check.outputs.need == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cfg
+
+      - name: 下载安装包
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          # 官方地址 + 社区归档回退
+          ARCHIVE=https://github.com/A-Randomm-User/EXE-save/releases/download/qq
+
+          for key in ntDownloadUrl ntDownloadX64Url ntDownloadARMUrl; do
+            URL=$(jq -r --arg k "$key" '.Windows[$k]' pc.json)
+            NAME=$(basename "$URL")
+            echo "处理 $NAME"
+
+            if curl -fsSL --retry 2 --connect-timeout 30 -o "out/$NAME" "$URL"; then
+              echo "  官方源下载成功"
+            else
+              echo "  官方源不可用，尝试社区归档"
+              if ! curl -fsSL --retry 3 --connect-timeout 30 -o "out/$NAME" "$ARCHIVE/$NAME"; then
+                echo "::error::$NAME 两个源都失败"
+                exit 1
+              fi
+            fi
+          done
+
+          # 经典版（非 NT 架构）
+          CLASSIC=$(jq -r '.Windows.downloadUrl' pc.json)
+          CNAME=$(basename "$CLASSIC")
+          echo "处理经典版 $CNAME"
+          curl -fsSL --retry 3 --connect-timeout 30 -o "out/$CNAME" "$CLASSIC"
+
+          ls -lh out
+
+      - name: 重命名为统一格式
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd out
+          for f in QQ_*.exe; do
+            [ -e "$f" ] || continue
+            arch=$(echo "$f" | sed -E 's/^QQ_[0-9.]+_[0-9]+_([a-z0-9]+)_[0-9]+\.exe$/\1/')
+            mv "$f" "QQ-${TAG}-${arch}.exe"
+          done
+          for f in QQ9*.exe; do
+            [ -e "$f" ] || continue
+            mv "$f" "QQ-9.7.25-classic.exe"
+          done
+          ls -lh
+
+      - name: 生成校验文件并发布
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum QQ-* > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo '## SHA256 Checksums'
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } > ../note.md
+          cd ..
+          if ! gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "QQ $TAG" --notes-file note.md
+          fi
+          gh release upload "$TAG" out/* --repo "$REPO" --clobber
+          echo "已发布 $TAG"
+
+  keepalive:
+    if: github.event_name == 'schedule'
+    name: Keepalive
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Re-enable workflow
+        run: |
+          case "${GITHUB_WORKFLOW_REF:?}" in
+          "${GITHUB_REPOSITORY:?}"/.github/workflows/*.y*ml@*) ;;
+          *) false ;;
+          esac
+          workflow="${GITHUB_WORKFLOW_REF%%@*}"
+          workflow="${workflow#${GITHUB_REPOSITORY}/.github/workflows/}"
+          echo "Re-enable $workflow"
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/enable"
