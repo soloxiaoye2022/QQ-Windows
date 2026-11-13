@@ -6,6 +6,15 @@ Archived installers for the Tencent QQ Windows client, past and present.
 
 Every file comes from Tencent's official download sources or community archives, unmodified.
 
+## Other platforms
+
+| Platform | Repository |
+| --- | --- |
+| Linux | [QQ-Linux](https://github.com/soloxiaoye2022/QQ-Linux) |
+| Windows | current |
+| macOS | [QQ-macOS](https://github.com/soloxiaoye2022/QQ-macOS) |
+| Android | [QQ-Android](https://github.com/soloxiaoye2022/QQ-Android) |
+
 ## Download
 
 - Latest: [latest release](https://github.com/soloxiaoye2022/QQ-Windows/releases/latest)
